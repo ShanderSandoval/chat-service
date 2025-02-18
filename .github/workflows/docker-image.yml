@@ -1,0 +1,101 @@
+name: Deploy Docker to EC2
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    name: Deploy Docker App on EC2
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Set permissions for SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.EC2_SSH_KEY }}" | tr -d '\r' > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H ${{ secrets.HOST_DNS }} >> ~/.ssh/known_hosts
+      - name: Build Docker image
+        run: |
+          docker build -t ${{ secrets.DOCKER_IMAGE_NAME }}:latest .
+          docker save -o app.tar ${{ secrets.DOCKER_IMAGE_NAME }}:latest
+      - name: Check if app.tar exists
+        run: |
+          if [ ! -f "app.tar" ]; then
+            echo "❌ ERROR: El archivo app.tar no existe."
+            exit 1
+          else
+            echo "✅ Archivo app.tar encontrado."
+          fi
+      - name: Set permissions for app.tar
+        run: |
+          sudo chmod 644 app.tar
+          ls -lah app.tar  # Verificar permisos
+      - name: Transfer Docker image to EC2
+        uses: appleboy/scp-action@master
+        with:
+          host: ${{ secrets.HOST_DNS }}
+          username: ${{ secrets.USERNAME }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          source: "app.tar"
+          target: "${{ secrets.TARGET_DIR }}"
+          rm: true  # Elimina archivos previos antes de copiar
+
+      - name: Run Docker container on EC2
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.HOST_DNS }}
+          username: ${{ secrets.USERNAME }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            echo "📌 Verificando e instalando Docker en EC2..."
+            
+            # Desinstalar containerd si causa conflictos
+            sudo apt-get remove -y containerd || true
+            
+            # Instalar Docker CE de manera segura
+            sudo apt-get update -y
+            sudo apt-get install -y ca-certificates curl gnupg lsb-release
+            # Agregar la clave GPG de Docker
+            sudo mkdir -m 0755 -p /etc/apt/keyrings
+            curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo tee /etc/apt/keyrings/docker.asc > /dev/null
+            sudo chmod a+r /etc/apt/keyrings/docker.asc
+            # Agregar el repositorio de Docker
+            echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+            
+            # Instalar Docker CE
+            sudo apt-get update -y
+            sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+            
+            echo "📌 Otorgando permisos al directorio destino..."
+            sudo chmod -R 777 ${{ secrets.TARGET_DIR }}
+            echo "📌 Cargando la imagen Docker..."
+            sudo docker load -i ${{ secrets.TARGET_DIR }}/app.tar
+            echo "📌 Verificando si el contenedor ya existe..."
+            if sudo docker ps -a --format '{{.Names}}' | grep -q "^${{ secrets.DOCKER_IMAGE_NAME }}$"; then
+              echo "📌 Deteniendo y eliminando el contenedor existente..."
+              sudo docker stop ${{ secrets.DOCKER_IMAGE_NAME }} || true
+              sudo docker rm ${{ secrets.DOCKER_IMAGE_NAME }} || true
+            else
+              echo "📌 No hay contenedor antiguo. Continuando con el despliegue..."
+            fi
+            echo "📌 Iniciando el nuevo contenedor con variables de entorno..."
+            sudo docker run -d \
+              --name ${{ secrets.DOCKER_IMAGE_NAME }} \
+              -p 10201:10201 \
+              -e HOST=${{ secrets.HOST }} \
+              -e MONGO_COLLECTION=${{ secrets.MONGO_COLLECTION }} \
+              -e MONGO_DATABASE=${{ secrets.MONGO_DATABASE }} \
+              -e MONGO_URI=${{ secrets.MONGO_URI }} \
+              -e NEO4J_PASSWORD=${{ secrets.NEO4J_PASSWORD }} \
+              -e NEO4J_URI=${{ secrets.NEO4J_URI }} \
+              -e NEO4J_USERNAME=${{ secrets.NEO4J_USERNAME }} \
+              -e PORT=${{ secrets.PORT }} \
+              -e REDIS_URI=${{ secrets.REDIS_URI }} \
+              ${{ secrets.DOCKER_IMAGE_NAME }}:latest
+            echo "✅ Despliegue completado con Docker 🚀"
